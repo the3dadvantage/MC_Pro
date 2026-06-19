@@ -5855,11 +5855,25 @@ def surface_deform(ob):
 def update_cloth(type=0):
     
     # run from either the frame handler or the timer
+    # Purge deleted objects here as well as in cloth_main. update_cloth is
+    # called directly by several operators/tests, and stale StructRNA entries
+    # otherwise raise ReferenceError before the timer cleanup can run.
+    dead_ids = []
+    for cloth_id, cloth in list(MC_data['cloths'].items()):
+        try:
+            cloth.ob.name
+            cloth.ob.data
+        except (ReferenceError, AttributeError):
+            dead_ids.append(cloth_id)
+    for cloth_id in dead_ids:
+        del MC_data['cloths'][cloth_id]
+
     if type == 0:
         surfaces = [i for i in bpy.data.objects if i.MC_props.sd_continuous]
         cloths = [i[1] for i in MC_data['cloths'].items() if i[1].ob.MC_props.continuous]
         if (len(cloths) == 0) & (len(surfaces) == 0):
-            bpy.app.timers.unregister(cloth_main)
+            if bpy.app.timers.is_registered(cloth_main):
+                bpy.app.timers.unregister(cloth_main)
 
     if type == 1:
         surfaces = [i for i in bpy.data.objects if i.MC_props.sd_animated]
@@ -6034,8 +6048,11 @@ def refresh(cloth, skip=False):
         cloth.has_butt_edges = False
         cloth.butt_edges, cloth.butt_tri_pairs = get_butt_edges(cloth)
 
-        if bpy.context.scene.MC_props.dev_mode:
-            cloth.four_edge_co = np.empty((cloth.eidx.shape[0], 4, 3), dtype=np.float32)
+        # Edge Collision is exposed in the normal UI, not only in developer
+        # mode. Its working buffer must therefore always exist. Previously it
+        # was allocated only with Dev Mode enabled, causing an immediate
+        # AttributeError when regular users enabled Edge Collision.
+        cloth.four_edge_co = np.empty((cloth.eidx.shape[0], 4, 3), dtype=np.float32)
 
         cloth.pierce_co = np.empty((cloth.eidx.shape[0], 2, 3), dtype=np.float32)
         #cloth.pierce_co2 = np.empty((cloth.eidx.shape[0] * 2, 3), dtype=np.float32)
@@ -6811,13 +6828,19 @@ def reload_from_save(scene=None):
 def cb_continuous(self, context):
     """Turn continuous update on or off"""
     install_handler(continuous=True)
-    ob = MC_data['recent_object']
-    if ob is None:
-        ob = bpy.context.object
-#    if "cloths" in MC_data:    
-#        if 'MC_cloth_id' in ob:    
-#            if ob['MC_cloth_id'] in MC_data["cloths"]:
-    cloth = MC_data["cloths"][ob['MC_cloth_id']]
+
+    # Property update callbacks must operate on the property owner. Using the
+    # global "recent_object" leaves a stale StructRNA reference after an
+    # object is deleted and can make unrelated cloth objects fail to start.
+    ob = self if isinstance(self, bpy.types.Object) else self.id_data
+    if ob is None or ob.name not in bpy.data.objects or 'MC_cloth_id' not in ob:
+        return
+
+    cloth_id = ob['MC_cloth_id']
+    if cloth_id not in MC_data["cloths"]:
+        return
+
+    cloth = MC_data["cloths"][cloth_id]
     cloth.co = get_co_edit(ob)
     cloth.velocity[:] = 0.0
     print()
@@ -9090,10 +9113,24 @@ def register(p1=False):
 def unregister():
     # classes
 
-    msg = 'Goodbye cruel world. I may be unregistered but I will live on in your hearts. MC_main FOREVER!'
-    bpy.context.window_manager.popup_menu(oops, title=msg, icon='ERROR')
+    # Blender 5.1 may unregister add-ons while no drawable UI context exists
+    # (background mode or application shutdown). Opening a popup here can
+    # crash Blender, so keep unregistration context-free.
 
     from bpy.utils import unregister_class
+
+    # Stop callbacks before removing RNA properties/classes. Otherwise a
+    # persistent timer or frame handler may run during add-on shutdown and
+    # access already-unregistered MC_props.
+    if bpy.app.timers.is_registered(cloth_main):
+        bpy.app.timers.unregister(cloth_main)
+
+    handler_names = np.array([i.__name__ for i in bpy.app.handlers.frame_change_post])
+    booly = [i == 'cloth_main' for i in handler_names]
+    idx = np.arange(handler_names.shape[0])
+    for i in idx[booly][::-1]:
+        del(bpy.app.handlers.frame_change_post[i])
+
     for cls in reversed(classes):
         try:    
             unregister_class(cls)
